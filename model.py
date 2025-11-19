@@ -9,16 +9,20 @@ class EventBase(BaseModel):
     title: str
     description: Optional[str] = None
     location: Optional[str] = None
-    event_time: Optional[datetime] = None
+    start_time: datetime
+    end_time: datetime
+    capacity: Optional[int] = None
 
 class EventCreate(EventBase):
-    created_by: int
+    pass  # created_by will be set from authenticated user
 
 class EventUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     location: Optional[str] = None
-    event_time: Optional[datetime] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    capacity: Optional[int] = None
 
 class EventResponse(EventBase):
     event_id: int
