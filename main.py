@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from routers import events
+from routers.events import router as events
 # from database import Base, engine
 
 # Create all tables (if not exist)
@@ -11,7 +11,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.include_router(events.router)
+app.include_router(events)
 
 @app.get("/")
 def root():
