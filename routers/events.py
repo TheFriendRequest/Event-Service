@@ -1,99 +1,76 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
-from typing import List
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from datetime import datetime
-from model import Base, Event, EventCreate, EventUpdate, EventResponse
+from typing import Optional, List
 
-# -------------------------
-# Database setup
-# -------------------------
-SQLALCHEMY_DATABASE_URL = "sqlite:///./events.db"  # change to Postgres/MySQL if needed
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# create tables
-Base.metadata.create_all(bind=engine)
-
-# -------------------------
-# FastAPI router
-# -------------------------
 router = APIRouter(prefix="/events", tags=["Events"])
 
-# Dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# -------------------------
+# Pydantic Schemas
+# -------------------------
+class EventBase(BaseModel):
+    title: str
+    description: Optional[str] = None
+    location: Optional[str] = None
+    event_time: Optional[datetime] = None
+
+class EventCreate(EventBase):
+    created_by: int
+
+class EventUpdate(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+    location: Optional[str] = None
+    event_time: Optional[datetime] = None
+
+class EventResponse(EventBase):
+    event_id: int
+    created_by: int
+    created_at: datetime
 
 # -------------------------
-# CRUD Operations
+# In-memory storage for demo
 # -------------------------
-def get_event(db: Session, event_id: int):
-    return db.query(Event).filter(Event.event_id == event_id, Event.deleted == False).first()
+events: List[EventResponse] = []
 
-def get_events(db: Session):
-    return db.query(Event).filter(Event.deleted == False).all()
+# -------------------------
+# CRUD Endpoints
+# -------------------------
+@router.get("/", response_model=List[EventResponse])
+def get_events():
+    return events
 
-def create_event(db: Session, event: EventCreate):
-    db_event = Event(
+@router.post("/", response_model=EventResponse)
+def create_event(event: EventCreate):
+    event_id = len(events) + 1
+    created_at = datetime.now()
+    new_event = EventResponse(
+        event_id=event_id,
         title=event.title,
         description=event.description,
         location=event.location,
         event_time=event.event_time,
         created_by=event.created_by,
-        created_at=datetime.utcnow(),
-        deleted=False
+        created_at=created_at
     )
-    db.add(db_event)
-    db.commit()
-    db.refresh(db_event)
-    return db_event
-
-def update_event(db: Session, db_event: Event, event_update: EventUpdate):
-    for key, value in event_update.dict(exclude_unset=True).items():
-        setattr(db_event, key, value)
-    db.commit()
-    db.refresh(db_event)
-    return db_event
-
-def delete_event(db: Session, db_event: Event):
-    db_event.deleted = True
-    db.commit()
-    return db_event
-
-# -------------------------
-# API Endpoints
-# -------------------------
-@router.get("/", response_model=List[EventResponse])
-def read_events(db: Session = Depends(get_db)):
-    return get_events(db)
-
-@router.get("/{event_id}", response_model=EventResponse)
-def read_event(event_id: int, db: Session = Depends(get_db)):
-    db_event = get_event(db, event_id)
-    if not db_event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return db_event
-
-@router.post("/", response_model=EventResponse)
-def create_new_event(event: EventCreate, db: Session = Depends(get_db)):
-    return create_event(db, event)
+    events.append(new_event)
+    return new_event
 
 @router.put("/{event_id}", response_model=EventResponse)
-@router.patch("/{event_id}", response_model=EventResponse)
-def update_existing_event(event_id: int, event_update: EventUpdate, db: Session = Depends(get_db)):
-    db_event = get_event(db, event_id)
-    if not db_event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return update_event(db, db_event, event_update)
+def update_event(event_id: int, update: EventUpdate):
+    for e in events:
+        if e.event_id == event_id:
+            updated_data = update.dict(exclude_unset=True)
+            for key, value in updated_data.items():
+                setattr(e, key, value)
+            return e
+    raise HTTPException(status_code=404, detail="Event not found")
 
 @router.delete("/{event_id}")
-def delete_existing_event(event_id: int, db: Session = Depends(get_db)):
-    db_event = get_event(db, event_id)
-    if not db_event:
-        raise HTTPException(status_code=404, detail="Event not found")
-    delete_event(db, db_event)
-    return {"msg": f"Event {event_id} deleted successfully"}
+def delete_event(event_id: int):
+    global events
+    for e in events:
+        if e.event_id == event_id:
+            events = [ev for ev in events if ev.event_id != event_id]
+            return {"msg": f"Event {event_id} deleted successfully"}
+    raise HTTPException(status_code=404, detail="Event not found")
