@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import verify_firebase_token, get_firebase_uid
+from auth import get_firebase_uid
 from model import EventCreate, EventUpdate, EventResponse
 
 router = APIRouter(prefix="/events", tags=["Events"])
@@ -239,6 +239,8 @@ def get_events(
     # Generate eTag for the collection
     etag = generate_etag({"events": events, "total": total, "skip": skip, "limit": limit})
     response.headers["ETag"] = f'"{etag}"'
+    print(f"[Event Service] Generated ETag for events collection: {etag}")
+    print(f"[Event Service] ETag header set: {response.headers.get('ETag')}")
     
     # Return with pagination metadata and HATEOAS links
     total_int = int(total) if total else 0
