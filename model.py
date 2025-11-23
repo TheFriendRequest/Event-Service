@@ -28,6 +28,8 @@ class EventResponse(EventBase):
     event_id: int
     created_by: int
     created_at: datetime
+    interests: Optional[list] = []
+    links: Optional[dict] = {}
 
     class Config:
         orm_mode = True
