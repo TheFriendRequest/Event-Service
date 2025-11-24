@@ -14,7 +14,7 @@ class EventBase(BaseModel):
     capacity: Optional[int] = None
 
 class EventCreate(EventBase):
-    pass  # created_by will be set from authenticated user
+    created_by: int  # user_id passed from Composite Service
 
 class EventUpdate(BaseModel):
     title: Optional[str] = None

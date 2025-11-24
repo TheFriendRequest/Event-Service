@@ -16,9 +16,8 @@ from model import EventCreate, EventUpdate, EventResponse
 router = APIRouter(prefix="/events", tags=["Events"])
 
 # ----------------------
-# In-memory task store for async processing
+# Task lock for thread safety (tasks now stored in database)
 # ----------------------
-task_store: Dict[str, Dict[str, Any]] = {}
 task_lock = threading.Lock()
 
 # ----------------------
@@ -29,28 +28,11 @@ def get_connection():
         host=os.getenv("DB_HOST", "127.0.0.1"),
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASS", "admin"),
-        database=os.getenv("DB_NAME", "event_db")
+        database=os.getenv("DB_NAME", "event_db"),
+        use_pure=True,
+        port=3306,
+        auth_plugin='mysql_native_password',
     )
-
-
-# ----------------------
-# Helper: Get user_id from Firebase UID
-# ----------------------
-def get_user_id_from_firebase_uid(firebase_uid: str) -> Optional[int]:
-    """Get user_id from Users table using Firebase UID"""
-    # Connect to user_db to get user_id
-    cnx = mysql.connector.connect(
-        host=os.getenv("DB_HOST", "127.0.0.1"),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASS", "admin"),
-        database=os.getenv("USER_DB_NAME", "user_db")
-    )
-    cur = cnx.cursor(dictionary=True)
-    cur.execute("SELECT user_id FROM Users WHERE firebase_uid = %s", (firebase_uid,))
-    row = cast(Optional[Dict[str, Any]], cur.fetchone())
-    cur.close()
-    cnx.close()
-    return cast(int, row['user_id']) if row and 'user_id' in row else None
 
 
 # ----------------------
@@ -98,13 +80,21 @@ def get_event_interests(event_id: int) -> list:
 # Async task processing function
 # ----------------------
 def process_event_async(task_id: str, event_data: dict, user_id: int):
-    """Background task to process event creation"""
+    """Background task to process event creation - stores tasks in database"""
     try:
+        cnx = get_connection()
+        cur = cnx.cursor()
+        
+        # Update task status to processing
+        cur.execute("""
+            UPDATE Tasks 
+            SET status = 'processing', started_at = NOW() 
+            WHERE task_id = %s
+        """, (task_id,))
+        cnx.commit()
+        
         # Simulate async processing (e.g., sending notifications, generating recommendations)
         time.sleep(2)  # Simulate processing time
-        
-        cnx = get_connection()
-        cur = cnx.cursor(dictionary=True)
         
         # Create the event
         sql = """
@@ -125,32 +115,65 @@ def process_event_async(task_id: str, event_data: dict, user_id: int):
         cnx.commit()
         event_id = cur.lastrowid
         
-        # Fetch the created event
-        cur.execute("""
+        # Fetch the created event (need dictionary cursor for this query)
+        cur_dict = cnx.cursor(dictionary=True)
+        cur_dict.execute("""
             SELECT event_id, title, description, location, start_time, end_time, 
                    capacity, created_by, created_at
             FROM Events
             WHERE event_id = %s
         """, (event_id,))
-        created_event = cur.fetchone()
+        created_event = cast(Optional[Dict[str, Any]], cur_dict.fetchone())
+        cur_dict.close()
+        
+        # Convert to dict for JSON serialization
+        if created_event:
+            start_time = created_event.get('start_time')
+            end_time = created_event.get('end_time')
+            created_at = created_event.get('created_at')
+            
+            event_dict = {
+                'event_id': created_event.get('event_id'),
+                'title': created_event.get('title'),
+                'description': created_event.get('description'),
+                'location': created_event.get('location'),
+                'start_time': start_time.isoformat() if isinstance(start_time, datetime) else (str(start_time) if start_time else ''),
+                'end_time': end_time.isoformat() if isinstance(end_time, datetime) else (str(end_time) if end_time else ''),
+                'capacity': created_event.get('capacity'),
+                'created_by': created_event.get('created_by'),
+                'created_at': created_at.isoformat() if isinstance(created_at, datetime) else (str(created_at) if created_at else '')
+            }
+            
+            # Update task as completed with result data
+            cur.execute("""
+                UPDATE Tasks 
+                SET status = 'completed', 
+                    completed_at = NOW(),
+                    result_data = %s
+                WHERE task_id = %s
+            """, (json.dumps(event_dict), task_id))
+            cnx.commit()
+        
         cur.close()
         cnx.close()
-        
-        # Update task status
-        with task_lock:
-            task_store[task_id] = {
-                "status": "completed",
-                "event_id": event_id,
-                "event": created_event,
-                "completed_at": datetime.now().isoformat()
-            }
     except Exception as e:
-        with task_lock:
-            task_store[task_id] = {
-                "status": "failed",
-                "error": str(e),
-                "failed_at": datetime.now().isoformat()
-            }
+        # Update task as failed
+        error_msg = str(e)
+        try:
+            cnx = get_connection()
+            cur = cnx.cursor()
+            cur.execute("""
+                UPDATE Tasks 
+                SET status = 'failed', 
+                    completed_at = NOW(),
+                    error_message = %s
+                WHERE task_id = %s
+            """, (error_msg, task_id))
+            cnx.commit()
+            cur.close()
+            cnx.close()
+        except Exception as db_error:
+            print(f"[Event Service] Error updating failed task in DB: {db_error}")
 
 
 # ----------------------
@@ -159,7 +182,7 @@ def process_event_async(task_id: str, event_data: dict, user_id: int):
 @router.get("/", response_model=Dict[str, Any])
 def get_events(
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),
+    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
     skip: int = Query(0, ge=0, description="Number of events to skip"),
     limit: int = Query(10, ge=1, le=100, description="Number of events to return"),
     location: Optional[str] = Query(None, description="Filter by location"),
@@ -266,7 +289,7 @@ def get_events(
 def get_event(
     event_id: int,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),
+    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
     if_none_match: Optional[str] = Header(None, alias="If-None-Match")
 ):
     """
@@ -317,21 +340,14 @@ def get_event(
 def create_event(
     event: EventCreate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)
+    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
 ):
     """
-    Create a new event (requires Firebase authentication).
-    The created_by field is automatically set from the authenticated user.
+    Create a new event.
+    The created_by field must be provided in the request body (user_id from Composite Service).
+    Firebase token is verified but firebase_uid is not used to look up user_id.
     Returns 201 Created with Location header.
     """
-    # Get user_id from Firebase UID
-    user_id = get_user_id_from_firebase_uid(firebase_uid)
-    if not user_id:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found in database. Please sync your account first."
-        )
-    
     # Validate that end_time is after start_time
     if event.end_time <= event.start_time:
         raise HTTPException(
@@ -353,7 +369,7 @@ def create_event(
         event.start_time,
         event.end_time,
         event.capacity,
-        user_id
+        event.created_by
     )
     
     cur.execute(sql, values)
@@ -400,20 +416,14 @@ def create_event(
 def create_event_async(
     event: EventCreate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)
+    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
 ):
     """
-    Create a new event asynchronously (requires Firebase authentication).
+    Create a new event asynchronously.
+    The created_by field must be provided in the request body (user_id from Composite Service).
+    Firebase token is verified but firebase_uid is not used to look up user_id.
     Returns 202 Accepted with a task ID for polling status.
     """
-    # Get user_id from Firebase UID
-    user_id = get_user_id_from_firebase_uid(firebase_uid)
-    if not user_id:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found in database. Please sync your account first."
-        )
-    
     # Validate that end_time is after start_time
     if event.end_time <= event.start_time:
         raise HTTPException(
@@ -424,18 +434,43 @@ def create_event_async(
     # Generate task ID
     task_id = str(uuid.uuid4())
     
-    # Store task as pending
-    with task_lock:
-        task_store[task_id] = {
-            "status": "pending",
-            "created_at": datetime.now().isoformat()
-        }
+    # Prepare event data for JSON serialization (convert datetime to string)
+    event_dict = event.dict()
+    # Convert datetime objects to ISO format strings for JSON serialization
+    if 'start_time' in event_dict and isinstance(event_dict['start_time'], datetime):
+        event_dict['start_time'] = event_dict['start_time'].isoformat()
+    if 'end_time' in event_dict and isinstance(event_dict['end_time'], datetime):
+        event_dict['end_time'] = event_dict['end_time'].isoformat()
+    
+    # Store task in database
+    cnx = get_connection()
+    cur = cnx.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO Tasks (task_id, task_type, status, request_data, created_by)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            task_id,
+            'create_event',
+            'pending',
+            json.dumps(event_dict, default=str),  # default=str handles any remaining non-serializable types
+            event.created_by
+        ))
+        cnx.commit()
+    except Exception as e:
+        cnx.rollback()
+        cur.close()
+        cnx.close()
+        raise HTTPException(status_code=500, detail=f"Failed to create task: {str(e)}")
+    finally:
+        cur.close()
+        cnx.close()
     
     # Start async processing in background thread
     event_data = event.dict()
     thread = threading.Thread(
         target=process_event_async,
-        args=(task_id, event_data, user_id)
+        args=(task_id, event_data, event.created_by)
     )
     thread.daemon = True
     thread.start()
@@ -454,54 +489,90 @@ def create_event_async(
 
 
 @router.get("/tasks/{task_id}")
-def get_task_status(task_id: str, firebase_uid: str = Depends(get_firebase_uid)):
+def get_task_status(
+    task_id: str,
+    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
+):
     """
     Poll the status of an async event creation task.
-    Returns task status and event data when completed.
+    Returns task status from database and event data when completed.
     """
-    with task_lock:
-        task = task_store.get(task_id)
-    
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    response_data = {
-        "task_id": task_id,
-        "status": task["status"],
-        "created_at": task.get("created_at")
-    }
-    
-    if task["status"] == "completed":
-        event = task.get("event")
-        if event and isinstance(event, dict):
-            # Convert datetime to string
-            start_time = event.get('start_time')
-            if start_time and isinstance(start_time, datetime):
-                event['start_time'] = start_time.isoformat()
-            end_time = event.get('end_time')
-            if end_time and isinstance(end_time, datetime):
-                event['end_time'] = end_time.isoformat()
-            created_at = event.get('created_at')
-            if created_at and isinstance(created_at, datetime):
-                event['created_at'] = created_at.isoformat()
-            
-            event_id = int(event.get('event_id', 0)) if event.get('event_id') else None
-            if event_id:
-                event['interests'] = get_event_interests(event_id)
-                event['links'] = add_links(event_id)
-            response_data["event"] = event
-            response_data["completed_at"] = task.get("completed_at")
-            event_id_val = event.get('event_id') if isinstance(event, dict) else None
-            if event_id_val:
-                response_data["links"] = {
-                    "event": f"/events/{event_id_val}",
-                    "self": f"/events/tasks/{task_id}"
-                }
-    elif task["status"] == "failed":
-        response_data["error"] = task.get("error")
-        response_data["failed_at"] = task.get("failed_at")
-    
-    return response_data
+    cnx = get_connection()
+    cur = cnx.cursor(dictionary=True)
+    try:
+        cur.execute("""
+            SELECT task_id, task_type, status, request_data, result_data, 
+                   error_message, created_at, started_at, completed_at, created_by
+            FROM Tasks
+            WHERE task_id = %s
+        """, (task_id,))
+        task = cast(Optional[Dict[str, Any]], cur.fetchone())
+        
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        
+        # Build response
+        response_data: Dict[str, Any] = {
+            "task_id": str(task.get("task_id", "")),
+            "task_type": str(task.get("task_type", "")),
+            "status": str(task.get("status", "")),
+            "links": {
+                "self": f"/events/tasks/{task_id}"
+            }
+        }
+        
+        # Handle created_at
+        created_at = task.get("created_at")
+        if created_at:
+            if isinstance(created_at, datetime):
+                response_data["created_at"] = created_at.isoformat()
+            else:
+                response_data["created_at"] = str(created_at)
+        
+        # Handle started_at
+        started_at = task.get("started_at")
+        if started_at:
+            if isinstance(started_at, datetime):
+                response_data["started_at"] = started_at.isoformat()
+            else:
+                response_data["started_at"] = str(started_at)
+        
+        # Handle completed status
+        if task.get("status") == "completed":
+            result_data = task.get("result_data")
+            if result_data and isinstance(result_data, str):
+                try:
+                    event = json.loads(result_data)
+                    event_id = event.get('event_id') if isinstance(event, dict) else None
+                    if event_id:
+                        event['interests'] = get_event_interests(event_id)
+                        event['links'] = add_links(event_id)
+                    response_data["event"] = event
+                    if isinstance(event, dict) and "event_id" in event:
+                        response_data["links"]["event"] = f"/events/{event['event_id']}"
+                except json.JSONDecodeError:
+                    pass
+            completed_at = task.get("completed_at")
+            if completed_at:
+                if isinstance(completed_at, datetime):
+                    response_data["completed_at"] = completed_at.isoformat()
+                else:
+                    response_data["completed_at"] = str(completed_at)
+        elif task.get("status") == "failed":
+            error_msg = task.get("error_message")
+            if error_msg:
+                response_data["error"] = str(error_msg)
+            completed_at = task.get("completed_at")
+            if completed_at:
+                if isinstance(completed_at, datetime):
+                    response_data["failed_at"] = completed_at.isoformat()
+                else:
+                    response_data["failed_at"] = str(completed_at)
+        
+        return response_data
+    finally:
+        cur.close()
+        cnx.close()
 
 
 @router.put("/{event_id}", response_model=EventResponse)
@@ -509,22 +580,16 @@ def update_event(
     event_id: int,
     update: EventUpdate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),
+    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    created_by: int = Query(..., description="User ID of the creator (for authorization check)"),
     if_match: Optional[str] = Header(None, alias="If-Match")
 ):
     """
-    Update an event (requires Firebase authentication).
+    Update an event.
     Supports eTag validation with If-Match header.
-    Users can only update events they created.
+    The created_by query parameter is used to verify the user is the creator.
+    Firebase token is verified but firebase_uid is not used to look up user_id.
     """
-    # Get user_id from Firebase UID
-    user_id = get_user_id_from_firebase_uid(firebase_uid)
-    if not user_id:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found in database. Please sync your account first."
-        )
-    
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     
@@ -541,7 +606,7 @@ def update_event(
         cnx.close()
         raise HTTPException(status_code=404, detail="Event not found")
     
-    if existing_event.get('created_by') != user_id:
+    if existing_event.get('created_by') != created_by:
         cur.close()
         cnx.close()
         raise HTTPException(
@@ -676,19 +741,16 @@ def update_event(
 
 
 @router.delete("/{event_id}")
-def delete_event(event_id: int, firebase_uid: str = Depends(get_firebase_uid)):
+def delete_event(
+    event_id: int,
+    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    created_by: int = Query(..., description="User ID of the creator (for authorization check)")
+):
     """
-    Delete an event (requires Firebase authentication).
-    Users can only delete events they created.
+    Delete an event.
+    The created_by query parameter is used to verify the user is the creator.
+    Firebase token is verified but firebase_uid is not used to look up user_id.
     """
-    # Get user_id from Firebase UID
-    user_id = get_user_id_from_firebase_uid(firebase_uid)
-    if not user_id:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found in database. Please sync your account first."
-        )
-    
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     
@@ -703,7 +765,7 @@ def delete_event(event_id: int, firebase_uid: str = Depends(get_firebase_uid)):
         cnx.close()
         raise HTTPException(status_code=404, detail="Event not found")
     
-    if event.get('created_by') != user_id:
+    if event.get('created_by') != created_by:
         cur.close()
         cnx.close()
         raise HTTPException(
