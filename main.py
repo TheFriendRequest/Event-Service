@@ -27,6 +27,10 @@ app.include_router(events.router)
 def root():
     return {"status": "Event Service running"}
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "service": "users"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
