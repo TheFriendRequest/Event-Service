@@ -1,16 +1,16 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Query, Header, Response
+from fastapi import APIRouter, HTTPException, Depends, status, Query, Header, Response, Request
 from typing import Optional, Dict, Any, List, cast
 from datetime import datetime
 import os
 import sys
-import mysql.connector
+import mysql.connector  # type: ignore
 import hashlib
 import json
 import threading
 import time
 import uuid
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from auth import get_firebase_uid
+# Authentication removed - trust x-firebase-uid header from API Gateway
 from model import EventCreate, EventUpdate, EventResponse
 
 router = APIRouter(prefix="/events", tags=["Events"])
@@ -36,6 +36,16 @@ def get_connection():
 
 
 # ----------------------
+# Helper: Get firebase_uid from header (set by API Gateway)
+# ----------------------
+def get_firebase_uid_from_header(request: Request) -> str:
+    """Get firebase_uid from x-firebase-uid header (injected by API Gateway)"""
+    firebase_uid = request.headers.get("x-firebase-uid") or request.headers.get("X-Firebase-Uid")
+    if not firebase_uid:
+        raise HTTPException(status_code=401, detail="Authentication required - x-firebase-uid header missing")
+    return firebase_uid
+
+# ----------------------
 # Helper: Generate eTag
 # ----------------------
 def generate_etag(data: dict) -> str:
@@ -50,10 +60,10 @@ def generate_etag(data: dict) -> str:
 def add_links(event_id: int, base_url: str = "") -> dict:
     """Add HATEOAS links to event"""
     return {
-        "self": f"{base_url}/events/{event_id}",
-        "collection": f"{base_url}/events",
-        "interests": f"{base_url}/events/{event_id}/interests",
-        "creator": f"{base_url}/users/{event_id}"  # Relative path example
+        "self": {"href": f"{base_url}/events/{event_id}"},
+        "collection": {"href": f"{base_url}/events"},
+        "interests": {"href": f"{base_url}/events/{event_id}/interests"},
+        "creator": {"href": f"{base_url}/users/{event_id}"}  # Relative path example
     }
 
 
@@ -182,7 +192,7 @@ def process_event_async(task_id: str, event_data: dict, user_id: int):
 @router.get("/", response_model=Dict[str, Any])
 def get_events(
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    request: Request,
     skip: int = Query(0, ge=0, description="Number of events to skip"),
     limit: int = Query(10, ge=1, le=100, description="Number of events to return"),
     location: Optional[str] = Query(None, description="Filter by location"),
@@ -194,7 +204,9 @@ def get_events(
     Get all events with pagination and query parameters.
     Supports filtering by location, created_by, and date range.
     Returns HATEOAS links and pagination metadata.
+    Trusts x-firebase-uid header from API Gateway.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     
@@ -276,11 +288,11 @@ def get_events(
         "limit": limit_int,
         "has_more": (skip_int + limit_int) < total_int,
         "links": {
-            "self": f"/events?skip={skip_int}&limit={limit_int}",
-            "first": f"/events?skip=0&limit={limit_int}",
-            "last": f"/events?skip={max(0, (total_int - 1) // limit_int * limit_int)}&limit={limit_int}",
-            "next": f"/events?skip={skip_int + limit_int}&limit={limit_int}" if (skip_int + limit_int) < total_int else None,
-            "prev": f"/events?skip={max(0, skip_int - limit_int)}&limit={limit_int}" if skip_int > 0 else None
+            "self": {"href": f"/events?skip={skip_int}&limit={limit_int}"},
+            "first": {"href": f"/events?skip=0&limit={limit_int}"},
+            "last": {"href": f"/events?skip={max(0, (total_int - 1) // limit_int * limit_int)}&limit={limit_int}"},
+            "next": {"href": f"/events?skip={skip_int + limit_int}&limit={limit_int}"} if (skip_int + limit_int) < total_int else None,
+            "prev": {"href": f"/events?skip={max(0, skip_int - limit_int)}&limit={limit_int}"} if skip_int > 0 else None
         }
     }
 
@@ -289,9 +301,11 @@ def get_events(
 def get_event(
     event_id: int,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    request: Request,
     if_none_match: Optional[str] = Header(None, alias="If-None-Match")
 ):
+    """Get a specific event by ID with eTag support. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     """
     Get a specific event by ID with eTag support.
     Returns 304 Not Modified if eTag matches.
@@ -340,8 +354,10 @@ def get_event(
 def create_event(
     event: EventCreate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
+    request: Request
 ):
+    """Create event. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     """
     Create a new event.
     The created_by field must be provided in the request body (user_id from Composite Service).
@@ -416,14 +432,15 @@ def create_event(
 def create_event_async(
     event: EventCreate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
+    request: Request
 ):
     """
     Create a new event asynchronously.
     The created_by field must be provided in the request body (user_id from Composite Service).
-    Firebase token is verified but firebase_uid is not used to look up user_id.
+    Trusts x-firebase-uid header from API Gateway.
     Returns 202 Accepted with a task ID for polling status.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     # Validate that end_time is after start_time
     if event.end_time <= event.start_time:
         raise HTTPException(
@@ -482,8 +499,8 @@ def create_event_async(
         "status": "pending",
         "message": "Event creation in progress",
         "links": {
-            "status": f"/events/tasks/{task_id}",
-            "self": f"/events/tasks/{task_id}"
+            "status": {"href": f"/events/tasks/{task_id}"},
+            "self": {"href": f"/events/tasks/{task_id}"}
         }
     }
 
@@ -491,8 +508,10 @@ def create_event_async(
 @router.get("/tasks/{task_id}")
 def get_task_status(
     task_id: str,
-    firebase_uid: str = Depends(get_firebase_uid)  # Verify Firebase token (defense in depth)
+    request: Request
 ):
+    """Get task status. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     """
     Poll the status of an async event creation task.
     Returns task status from database and event data when completed.
@@ -517,7 +536,7 @@ def get_task_status(
             "task_type": str(task.get("task_type", "")),
             "status": str(task.get("status", "")),
             "links": {
-                "self": f"/events/tasks/{task_id}"
+                "self": {"href": f"/events/tasks/{task_id}"}
             }
         }
         
@@ -549,7 +568,7 @@ def get_task_status(
                         event['links'] = add_links(event_id)
                     response_data["event"] = event
                     if isinstance(event, dict) and "event_id" in event:
-                        response_data["links"]["event"] = f"/events/{event['event_id']}"
+                        response_data["links"]["event"] = {"href": f"/events/{event['event_id']}"}
                 except json.JSONDecodeError:
                     pass
             completed_at = task.get("completed_at")
@@ -580,10 +599,12 @@ def update_event(
     event_id: int,
     update: EventUpdate,
     response: Response,
-    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    request: Request,
     created_by: int = Query(..., description="User ID of the creator (for authorization check)"),
     if_match: Optional[str] = Header(None, alias="If-Match")
 ):
+    """Update an event. Trusts x-firebase-uid header from API Gateway."""
+    firebase_uid = get_firebase_uid_from_header(request)
     """
     Update an event.
     Supports eTag validation with If-Match header.
@@ -743,14 +764,14 @@ def update_event(
 @router.delete("/{event_id}")
 def delete_event(
     event_id: int,
-    firebase_uid: str = Depends(get_firebase_uid),  # Verify Firebase token (defense in depth)
+    request: Request,
     created_by: int = Query(..., description="User ID of the creator (for authorization check)")
 ):
     """
-    Delete an event.
+    Delete an event. Trusts x-firebase-uid header from API Gateway.
     The created_by query parameter is used to verify the user is the creator.
-    Firebase token is verified but firebase_uid is not used to look up user_id.
     """
+    firebase_uid = get_firebase_uid_from_header(request)
     cnx = get_connection()
     cur = cnx.cursor(dictionary=True)
     
