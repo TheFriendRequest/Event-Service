@@ -29,9 +29,6 @@ def get_connection():
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASS", "admin"),
         database=os.getenv("DB_NAME", "event_db"),
-        use_pure=True,
-        port=3306,
-        auth_plugin='mysql_native_password',
     )
 
 
