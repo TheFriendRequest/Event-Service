@@ -1,0 +1,202 @@
+openapi: 3.0.3
+info:
+  title: Event Service API
+  description: API-first specification for the Event microservice.
+  version: "1.0.0"
+
+servers:
+  - url: https://event-service.example.com
+
+paths:
+  /events:
+    get:
+      summary: List events
+      description: Get all events with pagination and filtering.
+      parameters:
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: location
+          in: query
+          schema:
+            type: string
+        - name: created_by
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Paginated list of events
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventCollection"
+
+    post:
+      summary: Create event
+      description: Create a new event synchronously.
+      responses:
+        "201":
+          description: Event created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+
+  /events/async:
+    post:
+      summary: Create event asynchronously
+      description: Create an event using asynchronous processing.
+      responses:
+        "202":
+          description: Accepted for processing
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+
+  /events/{event_id}:
+    get:
+      summary: Get event
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: If-None-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event
+          headers:
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "304":
+          description: Not Modified
+
+    put:
+      summary: Update event
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: If-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated event
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+
+    delete:
+      summary: Delete event
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Deleted
+
+  /events/tasks/{task_id}:
+    get:
+      summary: Get async task status
+      parameters:
+        - name: task_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Task status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Task"
+
+components:
+  schemas:
+    Event:
+      type: object
+      properties:
+        event_id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: string
+        location:
+          type: string
+        start_time:
+          type: string
+          format: date-time
+        end_time:
+          type: string
+          format: date-time
+        capacity:
+          type: integer
+        created_by:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    EventCollection:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        total:
+          type: integer
+        skip:
+          type: integer
+        limit:
+          type: integer
+
+    Task:
+      type: object
+      properties:
+        task_id:
+          type: string
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
